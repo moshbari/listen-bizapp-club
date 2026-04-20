@@ -24,7 +24,6 @@ RUN npm install --omit=dev --no-audit --no-fund
 # App code
 COPY server.js ./
 COPY lib ./lib
-COPY public ./public
 
 # Persistent volume for SQLite — mounted by Coolify
 RUN mkdir -p /app/data
