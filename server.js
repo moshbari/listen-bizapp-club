@@ -245,6 +245,14 @@ const BASE_CSS = `
   audio { width: 100%; outline: none; }
   .part-label { color: var(--muted); font-size: 14px; margin-top: 8px; }
   .footer { margin-top: 40px; color: var(--muted); font-size: 13px; text-align: center; }
+  /* Resume-listening modal */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(15,23,42,0.55); display: none; align-items: center; justify-content: center; z-index: 100; padding: 20px; }
+  .modal-backdrop.is-open { display: flex; }
+  .modal { background: var(--card); border-radius: 14px; padding: 24px; max-width: 420px; width: 100%; box-shadow: 0 12px 32px rgba(0,0,0,0.2); }
+  .modal h2 { margin: 0 0 8px; font-size: 20px; }
+  .modal p { margin: 0 0 20px; color: var(--muted); font-size: 15px; line-height: 1.45; }
+  .modal .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .modal .row .btn { flex: 1 1 140px; }
 `;
 
 // ---------- routes ----------
@@ -739,27 +747,142 @@ app.get('/p/:slug', (req, res) => {
       <div class="part-label" id="partLabel">${totalParts > 1 ? 'Part 1 of ' + totalParts : ''}</div>
       ${downloadBlock}
     </div>
+    <div id="resumeModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="resumeTitle">
+      <div class="modal">
+        <h2 id="resumeTitle">Welcome back</h2>
+        <p id="resumeMsg">You stopped at <span id="resumeAt">0:00</span>. Pick up where you left off, or start from the beginning?</p>
+        <div class="row">
+          <button type="button" class="btn" id="resumeContinue">▶ Continue</button>
+          <button type="button" class="btn btn-secondary" id="resumeRestart">↺ Start over</button>
+        </div>
+      </div>
+    </div>
     <div class="footer">Shared from ${escHtml(SITE_NAME)}</div>
     <script>
       const parts = ${JSON.stringify(parts.map(p => p.url))};
       const player = document.getElementById('player');
       const label = document.getElementById('partLabel');
+      const STORAGE_KEY = 'listen:${rec.slug}';
       let idx = 0;
+
+      // ---------- label helper ----------
+      function setPartLabel(i) {
+        label.textContent = parts.length > 1 ? 'Part ' + (i + 1) + ' of ' + parts.length : '';
+      }
+
+      // ---------- position persistence ----------
+      // Save format: { partIdx, t, updatedAt }. Per-slug key → different
+      // recordings don't collide. localStorage is per-browser by default,
+      // which matches what we want ("browser-wise" resume).
+      let lastSavedAt = 0;
+      function savePosition(force) {
+        // Don't persist trivial positions — avoids the modal appearing
+        // when the user just clicked the link and immediately left.
+        if (!player.src) return;
+        const t = player.currentTime;
+        if (!Number.isFinite(t)) return;
+        if (!force && t < 3) return;                   // ignore first 3s
+        const now = Date.now();
+        if (!force && now - lastSavedAt < 2500) return; // throttle to 2.5s
+        lastSavedAt = now;
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify({
+            partIdx: idx,
+            t: t,
+            updatedAt: now,
+          }));
+        } catch { /* quota or disabled — nothing we can do */ }
+      }
+      function clearPosition() {
+        try { localStorage.removeItem(STORAGE_KEY); } catch {}
+      }
+
+      player.addEventListener('timeupdate', () => savePosition(false));
+      player.addEventListener('pause', () => savePosition(true));
+      document.addEventListener('visibilitychange', () => {
+        // Fires reliably on mobile when the user backgrounds the tab,
+        // unlike 'beforeunload' which is unreliable on iOS Safari.
+        if (document.visibilityState === 'hidden') savePosition(true);
+      });
+      window.addEventListener('pagehide', () => savePosition(true));
+
+      // ---------- part advance (existing ended-handler logic) ----------
       player.addEventListener('ended', () => {
         if (idx < parts.length - 1) {
           idx += 1;
           player.src = parts[idx];
-          label.textContent = 'Part ' + (idx + 1) + ' of ' + parts.length;
+          setPartLabel(idx);
           player.play().catch(() => {
-            // Autoplay blocked — show a button
             label.innerHTML = 'Part ' + (idx + 1) + ' of ' + parts.length + ' — <a href="#" id="nextBtn">tap to play</a>';
             document.getElementById('nextBtn').addEventListener('click', (e) => {
               e.preventDefault();
               player.play();
             });
           });
+        } else {
+          // Reached the end of the final part — clear so next visit starts fresh.
+          clearPosition();
         }
       });
+
+      // ---------- resume modal ----------
+      function fmtTime(sec) {
+        sec = Math.max(0, Math.floor(sec || 0));
+        const m = Math.floor(sec / 60);
+        const s = sec % 60;
+        return m + ':' + (s < 10 ? '0' : '') + s;
+      }
+
+      function seekTo(partIdx, t) {
+        idx = Math.max(0, Math.min(parts.length - 1, partIdx | 0));
+        setPartLabel(idx);
+        if (player.src !== parts[idx]) player.src = parts[idx];
+        const doSeek = () => {
+          try { player.currentTime = t; } catch {}
+        };
+        if (player.readyState >= 1) {
+          doSeek();
+        } else {
+          player.addEventListener('loadedmetadata', doSeek, { once: true });
+          player.load();
+        }
+      }
+
+      (function maybeShowResume() {
+        let saved;
+        try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null'); } catch { saved = null; }
+        if (!saved) return;
+        const partIdx = saved.partIdx | 0;
+        const t = Number(saved.t) || 0;
+        if (partIdx < 0 || partIdx >= parts.length) { clearPosition(); return; }
+        if (t < 3) { clearPosition(); return; } // trivial — ignore
+
+        // Global elapsed for nicer display across multi-part recordings.
+        // We don't know part durations here, so just show the in-part time
+        // plus a "Part X" hint if multi-part.
+        const at = parts.length > 1
+          ? 'Part ' + (partIdx + 1) + ' · ' + fmtTime(t)
+          : fmtTime(t);
+        document.getElementById('resumeAt').textContent = at;
+
+        const modal = document.getElementById('resumeModal');
+        modal.classList.add('is-open');
+
+        document.getElementById('resumeContinue').addEventListener('click', () => {
+          modal.classList.remove('is-open');
+          seekTo(partIdx, t);
+          player.play().catch(() => { /* autoplay blocked — user can tap play */ });
+        });
+        document.getElementById('resumeRestart').addEventListener('click', () => {
+          modal.classList.remove('is-open');
+          clearPosition();
+          idx = 0;
+          setPartLabel(0);
+          if (player.src !== parts[0]) player.src = parts[0];
+          try { player.currentTime = 0; } catch {}
+          player.play().catch(() => { /* autoplay blocked */ });
+        });
+      })();
     </script>
   `;
 
