@@ -164,6 +164,39 @@ function baseFilename(originalName) {
   return path.parse(originalName).name || '';
 }
 
+// How many items per Recent page. Tuned for ~4-5 cards per viewport on mobile;
+// IntersectionObserver triggers the next fetch while the user is still scrolling.
+const RECENT_PAGE_SIZE = 10;
+
+/**
+ * Render one card's HTML. Used both for the initial server-rendered list
+ * and for the JSON responses of /api/recent — same template, no drift.
+ */
+function renderRecentCard(r) {
+  const shareLink = `${PUBLIC_ORIGIN}/p/${r.slug}`;
+  const title = r.title || 'Voice memo';
+  return `
+    <div class="card stack recent-item" data-slug="${escHtml(r.slug)}" data-id="${r.id}">
+      <div>
+        <div style="font-weight: 600; font-size: 16px; word-break: break-word;" class="recent-title">${escHtml(title)}</div>
+        <div class="muted" style="font-size: 13px; margin-top: 2px;">
+          ${fmtDuration(r.duration_sec)} · ${r.parts.length} part${r.parts.length !== 1 ? 's' : ''}
+        </div>
+        <div class="muted" style="font-size: 12px; margin-top: 2px;">
+          ${escHtml(fmtGstTimestamp(r.created_at))}
+        </div>
+      </div>
+      <div class="link-box recent-link">${escHtml(shareLink)}</div>
+      <button type="button" class="btn btn-block copy-btn" data-url="${escHtml(shareLink)}">Copy link</button>
+      <div class="row">
+        <a class="btn btn-secondary" href="/p/${escHtml(r.slug)}" target="_blank" rel="noopener">Open</a>
+        <button type="button" class="btn btn-secondary rename-btn" data-slug="${escHtml(r.slug)}">Rename</button>
+        <button type="button" class="btn btn-danger delete-btn" data-slug="${escHtml(r.slug)}" data-title="${escHtml(title)}">Delete</button>
+      </div>
+    </div>
+  `;
+}
+
 const BASE_CSS = `
   :root { --fg:#111; --muted:#666; --bg:#fafafa; --card:#fff; --brand:#2563eb; --brand-dark:#1d4ed8; --ok:#16a34a; --err:#dc2626; --border:#e5e7eb; }
   * { box-sizing: border-box; }
@@ -259,94 +292,139 @@ app.post('/logout', (req, res) => {
 });
 
 app.get('/upload', requireOwner, (req, res) => {
-  const recent = db.listRecent(20);
-  const recentHtml = recent.length === 0 ? '' : `
+  const firstPage = db.listRecent({ limit: RECENT_PAGE_SIZE });
+  // Cursor for the next page — the lowest id we rendered. `null` means
+  // "no more" (won't happen here unless the user has exactly 0 recordings,
+  // but we also use null later when the server signals end-of-list).
+  const nextCursor = firstPage.length === RECENT_PAGE_SIZE
+    ? firstPage[firstPage.length - 1].id
+    : null;
+
+  const recentHtml = firstPage.length === 0 ? '' : `
     <h2>Recent</h2>
-    ${recent.map(r => {
-      const shareLink = `${PUBLIC_ORIGIN}/p/${r.slug}`;
-      const title = r.title || 'Voice memo';
-      return `
-        <div class="card stack recent-item" data-slug="${r.slug}">
-          <div>
-            <div style="font-weight: 600; font-size: 16px; word-break: break-word;" class="recent-title">${escHtml(title)}</div>
-            <div class="muted" style="font-size: 13px; margin-top: 2px;">
-              ${fmtDuration(r.duration_sec)} · ${r.parts.length} part${r.parts.length !== 1 ? 's' : ''}
-            </div>
-            <div class="muted" style="font-size: 12px; margin-top: 2px;">
-              ${escHtml(fmtGstTimestamp(r.created_at))}
-            </div>
-          </div>
-          <div class="link-box recent-link">${escHtml(shareLink)}</div>
-          <button type="button" class="btn btn-block copy-btn" data-url="${escHtml(shareLink)}">Copy link</button>
-          <div class="row">
-            <a class="btn btn-secondary" href="/p/${r.slug}" target="_blank" rel="noopener">Open</a>
-            <button type="button" class="btn btn-secondary rename-btn" data-slug="${r.slug}">Rename</button>
-            <button type="button" class="btn btn-danger delete-btn" data-slug="${r.slug}" data-title="${escHtml(title)}">Delete</button>
-          </div>
-        </div>
-      `;
-    }).join('')}
+    <div id="recent-list">
+      ${firstPage.map(renderRecentCard).join('')}
+    </div>
+    ${nextCursor != null ? `
+      <div id="recent-sentinel" data-cursor="${nextCursor}" class="muted" style="text-align: center; padding: 16px;">
+        Loading more…
+      </div>
+    ` : ''}
     <script>
-      // ---- Copy link ----
-      document.querySelectorAll('.copy-btn').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          const url = btn.dataset.url;
-          try {
-            await navigator.clipboard.writeText(url);
-            const prev = btn.textContent;
-            btn.textContent = 'Copied!';
-            setTimeout(() => { btn.textContent = prev; }, 1500);
-          } catch (e) {
-            btn.textContent = 'Copy failed — long-press the link';
-          }
-        });
-      });
+      // ---- Event delegation on #recent-list — one set of handlers covers
+      //      both the initial cards and everything we append on scroll. ----
+      (function () {
+        const list = document.getElementById('recent-list');
+        if (!list) return;
 
-      // ---- Rename ----
-      document.querySelectorAll('.rename-btn').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          const item = btn.closest('.recent-item');
-          const current = item.querySelector('.recent-title').textContent;
-          const next = prompt('New title', current);
-          if (next == null) return;
-          const title = next.trim();
-          if (!title) { alert('Title cannot be empty.'); return; }
-          const res = await fetch('/api/rename/' + btn.dataset.slug, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title }),
-            credentials: 'same-origin',
-          });
-          if (res.ok) {
-            item.querySelector('.recent-title').textContent = title;
-          } else {
-            alert('Rename failed.');
-          }
-        });
-      });
+        list.addEventListener('click', async (e) => {
+          const btn = e.target.closest('button, a');
+          if (!btn) return;
 
-      // ---- Delete ----
-      document.querySelectorAll('.delete-btn').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          const title = btn.dataset.title || 'this recording';
-          const ok = confirm('Delete "' + title + '"?\\n\\nThe share link will stop working and the audio will be removed from storage. This cannot be undone.');
-          if (!ok) return;
-          btn.disabled = true;
-          btn.textContent = 'Deleting…';
-          const res = await fetch('/api/delete/' + btn.dataset.slug, {
-            method: 'POST',
-            credentials: 'same-origin',
-          });
-          if (res.ok) {
+          // Copy link
+          if (btn.classList.contains('copy-btn')) {
+            const url = btn.dataset.url;
+            try {
+              await navigator.clipboard.writeText(url);
+              const prev = btn.textContent;
+              btn.textContent = 'Copied!';
+              setTimeout(() => { btn.textContent = prev; }, 1500);
+            } catch (err) {
+              btn.textContent = 'Copy failed — long-press the link';
+            }
+            return;
+          }
+
+          // Rename
+          if (btn.classList.contains('rename-btn')) {
             const item = btn.closest('.recent-item');
-            item.parentNode.removeChild(item);
-          } else {
-            btn.disabled = false;
-            btn.textContent = 'Delete';
-            alert('Delete failed.');
+            const current = item.querySelector('.recent-title').textContent;
+            const next = prompt('New title', current);
+            if (next == null) return;
+            const title = next.trim();
+            if (!title) { alert('Title cannot be empty.'); return; }
+            const res = await fetch('/api/rename/' + btn.dataset.slug, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ title }),
+              credentials: 'same-origin',
+            });
+            if (res.ok) {
+              item.querySelector('.recent-title').textContent = title;
+              // Keep the Delete button's data-title in sync so the confirm
+              // message matches the renamed record.
+              const delBtn = item.querySelector('.delete-btn');
+              if (delBtn) delBtn.dataset.title = title;
+            } else {
+              alert('Rename failed.');
+            }
+            return;
+          }
+
+          // Delete
+          if (btn.classList.contains('delete-btn')) {
+            const title = btn.dataset.title || 'this recording';
+            const ok = confirm('Delete "' + title + '"?\\n\\nThe share link will stop working and the audio will be removed from storage. This cannot be undone.');
+            if (!ok) return;
+            btn.disabled = true;
+            btn.textContent = 'Deleting…';
+            const res = await fetch('/api/delete/' + btn.dataset.slug, {
+              method: 'POST',
+              credentials: 'same-origin',
+            });
+            if (res.ok) {
+              btn.closest('.recent-item').remove();
+            } else {
+              btn.disabled = false;
+              btn.textContent = 'Delete';
+              alert('Delete failed.');
+            }
+            return;
           }
         });
-      });
+
+        // ---- Infinite scroll: IntersectionObserver on a sentinel div ----
+        //
+        // When the sentinel crosses into the viewport (with 200px rootMargin
+        // so the fetch starts before the user reaches the bottom), we hit
+        // /api/recent?before=<cursor>&limit=N. Server returns { html, nextCursor }.
+        // Append html, update cursor; when nextCursor is null the server is
+        // telling us "that was the last page" — we disconnect and remove the
+        // sentinel so the "Loading more…" text doesn't linger.
+        const sentinel = document.getElementById('recent-sentinel');
+        if (!sentinel || !('IntersectionObserver' in window)) return;
+
+        let loading = false;
+        const io = new IntersectionObserver(async (entries) => {
+          for (const entry of entries) {
+            if (!entry.isIntersecting || loading) continue;
+            loading = true;
+            const cursor = sentinel.dataset.cursor;
+            try {
+              const res = await fetch('/api/recent?before=' + encodeURIComponent(cursor) + '&limit=${RECENT_PAGE_SIZE}', {
+                credentials: 'same-origin',
+              });
+              if (!res.ok) throw new Error('HTTP ' + res.status);
+              const data = await res.json();
+              if (data.html) {
+                list.insertAdjacentHTML('beforeend', data.html);
+              }
+              if (data.nextCursor == null) {
+                io.disconnect();
+                sentinel.remove();
+              } else {
+                sentinel.dataset.cursor = data.nextCursor;
+                loading = false;
+              }
+            } catch (err) {
+              console.error('[recent] load more failed', err);
+              sentinel.textContent = 'Could not load more — scroll to retry.';
+              loading = false;
+            }
+          }
+        }, { rootMargin: '200px 0px' });
+        io.observe(sentinel);
+      })();
     </script>
   `;
 
@@ -540,6 +618,28 @@ app.post('/api/upload', requireOwner, upload.single('audio'), async (req, res) =
     try { fs.unlinkSync(file.path); } catch {}
     try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
   }
+});
+
+// ---- Admin-only: paginated Recent list. Returns pre-rendered card HTML ----
+//
+// Query params:
+//   before — required cursor (the lowest id from the previous page)
+//   limit  — optional, clamped 1..50, defaults to RECENT_PAGE_SIZE
+//
+// Response: { html: "<div>…</div><div>…</div>", nextCursor: <id|null> }
+// When nextCursor is null the caller should stop asking — that was the last page.
+app.get('/api/recent', requireOwner, (req, res) => {
+  const before = parseInt(req.query.before, 10);
+  if (!Number.isFinite(before) || before <= 0) {
+    return res.status(400).json({ error: 'before cursor required' });
+  }
+  const limit = Math.max(1, Math.min(50, parseInt(req.query.limit, 10) || RECENT_PAGE_SIZE));
+  const rows = db.listRecent({ before, limit });
+  const nextCursor = rows.length === limit ? rows[rows.length - 1].id : null;
+  res.json({
+    html: rows.map(renderRecentCard).join(''),
+    nextCursor,
+  });
 });
 
 // ---- Admin-only: rename a recording's title. JSON body: {title: "..."} ----
