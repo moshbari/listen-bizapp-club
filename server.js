@@ -73,6 +73,34 @@ function fmtDuration(sec) {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+/**
+ * Format a SQLite CURRENT_TIMESTAMP (UTC, "YYYY-MM-DD HH:MM:SS") as Gulf
+ * Standard Time (Asia/Dubai, UTC+4) — what Mosh sees on his phone.
+ * Example output: "Apr 20, 2026 · 9:29 AM GST"
+ */
+function fmtGstTimestamp(createdAt) {
+  if (!createdAt) return '';
+  // SQLite CURRENT_TIMESTAMP has no TZ suffix but is UTC. Append Z so the JS
+  // Date parses it as UTC instead of local time.
+  const raw = String(createdAt).trim();
+  const iso = raw.includes('T') ? raw : raw.replace(' ', 'T') + (raw.endsWith('Z') ? '' : 'Z');
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  try {
+    const date = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Dubai',
+      month: 'short', day: 'numeric', year: 'numeric',
+    }).format(d);
+    const time = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Dubai',
+      hour: 'numeric', minute: '2-digit', hour12: true,
+    }).format(d);
+    return `${date} · ${time} GST`;
+  } catch {
+    return '';
+  }
+}
+
 function layout({ title, body, ogTitle, ogDescription, ogAudioUrl, noindex = true }) {
   const og = [
     `<meta property="og:site_name" content="${SITE_NAME}">`,
@@ -97,6 +125,12 @@ function layout({ title, body, ogTitle, ogDescription, ogAudioUrl, noindex = tru
   <style>${BASE_CSS}</style>
 </head>
 <body>
+  <header class="site-header">
+    <a href="/" class="brand" aria-label="${escHtml(SITE_NAME)} — home">
+      <span class="brand-mark">🎙</span>
+      <span class="brand-name">${escHtml(SITE_NAME)}</span>
+    </a>
+  </header>
   <main>
     ${body}
   </main>
@@ -135,6 +169,10 @@ const BASE_CSS = `
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
   body { font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--fg); min-height: 100vh; }
+  .site-header { background: #0f172a; padding: 14px 20px; }
+  .site-header .brand { display: inline-flex; align-items: center; gap: 8px; color: #fff; text-decoration: none; font-weight: 700; font-size: 17px; letter-spacing: -0.01em; }
+  .site-header .brand:hover { opacity: 0.85; }
+  .site-header .brand-mark { font-size: 20px; line-height: 1; }
   main { max-width: 640px; margin: 0 auto; padding: 32px 20px 64px; }
   h1 { font-size: 28px; margin: 0 0 8px; }
   h2 { font-size: 20px; margin: 24px 0 8px; }
@@ -152,6 +190,17 @@ const BASE_CSS = `
   .btn-danger:disabled { opacity: 0.6; cursor: default; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; }
   .row .btn { flex: 1 1 auto; padding: 10px 14px; font-size: 14px; min-height: 44px; text-align: center; }
+  .dropzone { position: relative; border: 2px dashed #cbd5e1; border-radius: 12px; background: #fff; transition: border-color .15s, background-color .15s; cursor: pointer; }
+  .dropzone:hover { border-color: var(--brand); background: #f8fafc; }
+  .dropzone.is-dragover { border-color: var(--brand); background: #eff6ff; }
+  .dropzone input[type="file"] { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+  .dropzone-inner { padding: 32px 20px; text-align: center; pointer-events: none; }
+  .dropzone-icon { font-size: 44px; line-height: 1; margin-bottom: 8px; }
+  .dropzone-text strong { display: block; font-size: 16px; color: var(--fg); }
+  .dropzone-text .sub { display: block; font-size: 14px; color: var(--muted); margin-top: 4px; }
+  .dropzone-filename { display: none; margin-top: 12px; font-weight: 600; color: var(--brand); word-break: break-all; font-size: 14px; }
+  .dropzone.has-file .dropzone-filename { display: block; }
+  .dropzone.has-file .dropzone-icon { color: var(--ok); }
   input[type="file"], input[type="password"], input[type="text"] { display: block; width: 100%; padding: 12px 14px; font-size: 16px; border: 1px solid var(--border); border-radius: 10px; background: #fff; }
   input[type="file"] { padding: 10px; }
   label { display: block; font-weight: 600; margin-bottom: 6px; }
@@ -222,6 +271,9 @@ app.get('/upload', requireOwner, (req, res) => {
             <div style="font-weight: 600; font-size: 16px; word-break: break-word;" class="recent-title">${escHtml(title)}</div>
             <div class="muted" style="font-size: 13px; margin-top: 2px;">
               ${fmtDuration(r.duration_sec)} · ${r.parts.length} part${r.parts.length !== 1 ? 's' : ''}
+            </div>
+            <div class="muted" style="font-size: 12px; margin-top: 2px;">
+              ${escHtml(fmtGstTimestamp(r.created_at))}
             </div>
           </div>
           <div class="link-box recent-link">${escHtml(shareLink)}</div>
@@ -310,7 +362,17 @@ app.get('/upload', requireOwner, (req, res) => {
         </div>
         <div>
           <label for="audio">Audio file</label>
-          <input id="audio" name="audio" type="file" accept="audio/*,.m4a,.mp3,.wav,.aac,.mp4,.mov" required>
+          <div class="dropzone" id="dropzone">
+            <input id="audio" name="audio" type="file" accept="audio/*,.m4a,.mp3,.wav,.aac,.mp4,.mov" required>
+            <div class="dropzone-inner">
+              <div class="dropzone-icon" id="dropzoneIcon">🎙</div>
+              <div class="dropzone-text">
+                <strong>Drop your voice memo here</strong>
+                <span class="sub">or tap to choose a file — .m4a, .mp3, .wav, .aac</span>
+              </div>
+              <div class="dropzone-filename" id="dropzoneFilename"></div>
+            </div>
+          </div>
         </div>
         <button type="submit" class="btn btn-block" id="submitBtn">Upload and make link</button>
         <p class="muted" id="status" style="display:none;"></p>
@@ -331,6 +393,52 @@ app.get('/upload', requireOwner, (req, res) => {
           status.style.display = 'block';
           status.textContent = 'Transcoding and sending to storage…';
         });
+
+        // ---- Dropzone: drag/drop + click + filename echo ----
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('audio');
+        const filenameEl = document.getElementById('dropzoneFilename');
+        const iconEl = document.getElementById('dropzoneIcon');
+
+        function showFilename() {
+          const f = fileInput.files && fileInput.files[0];
+          if (f) {
+            filenameEl.textContent = f.name;
+            dropzone.classList.add('has-file');
+            iconEl.textContent = '✅';
+          } else {
+            filenameEl.textContent = '';
+            dropzone.classList.remove('has-file');
+            iconEl.textContent = '🎙';
+          }
+        }
+
+        ['dragenter', 'dragover'].forEach(ev => {
+          dropzone.addEventListener(ev, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropzone.classList.add('is-dragover');
+          });
+        });
+        ['dragleave', 'drop'].forEach(ev => {
+          dropzone.addEventListener(ev, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropzone.classList.remove('is-dragover');
+          });
+        });
+        dropzone.addEventListener('drop', (e) => {
+          if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+            // Assign the dropped file(s) into the file input so the form submits them.
+            try {
+              fileInput.files = e.dataTransfer.files;
+            } catch (err) {
+              // Some browsers don't allow direct assignment — fall through to change handler.
+            }
+            showFilename();
+          }
+        });
+        fileInput.addEventListener('change', showFilename);
       </script>
     `,
   }));
