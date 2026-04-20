@@ -849,6 +849,15 @@ app.get('/p/:slug', (req, res) => {
       }
 
       (function maybeShowResume() {
+        // Only prompt on a FRESH browser session — not on a same-tab refresh.
+        // sessionStorage persists through reloads but dies when the tab/browser
+        // closes, so its absence means "they left and came back."
+        const SESSION_KEY = 'listen:session:${rec.slug}';
+        let freshSession = true;
+        try { freshSession = sessionStorage.getItem(SESSION_KEY) !== '1'; } catch {}
+        try { sessionStorage.setItem(SESSION_KEY, '1'); } catch {}
+        if (!freshSession) return;
+
         let saved;
         try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null'); } catch { saved = null; }
         if (!saved) return;
