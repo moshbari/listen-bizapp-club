@@ -110,6 +110,26 @@ function escHtml(s = '') {
   }[c]));
 }
 
+/**
+ * Sanitize a title/filename for use as a GHL displayName and an HTTP download
+ * filename. Keep it friendly (letters, numbers, space, dash, underscore, dot)
+ * and short enough that GHL's UI doesn't truncate awkwardly.
+ */
+function sanitizeForFilename(s) {
+  return String(s || '')
+    .replace(/[^\p{L}\p{N}._\- ]+/gu, '-')  // any other char → dash
+    .replace(/-{2,}/g, '-')                 // collapse runs
+    .replace(/^[\-_.\s]+|[\-_.\s]+$/g, '')  // trim punctuation
+    .slice(0, 80)
+    || 'voice-memo';
+}
+
+/** Filename without the extension (".m4a"/".mp3"/…) */
+function baseFilename(originalName) {
+  if (!originalName) return '';
+  return path.parse(originalName).name || '';
+}
+
 const BASE_CSS = `
   :root { --fg:#111; --muted:#666; --bg:#fafafa; --card:#fff; --brand:#2563eb; --brand-dark:#1d4ed8; --ok:#16a34a; --err:#dc2626; --border:#e5e7eb; }
   * { box-sizing: border-box; }
@@ -127,6 +147,11 @@ const BASE_CSS = `
   .btn-block { display: block; width: 100%; text-align: center; }
   .btn-secondary { background: #fff; color: var(--fg); border: 1px solid var(--border); }
   .btn-secondary:hover { background: #f3f4f6; }
+  .btn-danger { background: #fff; color: var(--err); border: 1px solid #fecaca; }
+  .btn-danger:hover { background: #fef2f2; }
+  .btn-danger:disabled { opacity: 0.6; cursor: default; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row .btn { flex: 1 1 auto; padding: 10px 14px; font-size: 14px; min-height: 44px; text-align: center; }
   input[type="file"], input[type="password"], input[type="text"] { display: block; width: 100%; padding: 12px 14px; font-size: 16px; border: 1px solid var(--border); border-radius: 10px; background: #fff; }
   input[type="file"] { padding: 10px; }
   label { display: block; font-weight: 600; margin-bottom: 6px; }
@@ -185,17 +210,92 @@ app.post('/logout', (req, res) => {
 });
 
 app.get('/upload', requireOwner, (req, res) => {
-  const recent = db.listRecent(10);
+  const recent = db.listRecent(20);
   const recentHtml = recent.length === 0 ? '' : `
     <h2>Recent</h2>
-    <div class="card">
-      ${recent.map(r => `
-        <div style="padding: 10px 0; border-bottom: 1px solid var(--border);">
-          <div><a href="/p/${r.slug}">/p/${r.slug}</a></div>
-          <div class="muted" style="font-size: 13px;">${escHtml(r.title || '(untitled)')} · ${fmtDuration(r.duration_sec)} · ${r.parts.length} part${r.parts.length !== 1 ? 's' : ''}</div>
+    ${recent.map(r => {
+      const shareLink = `${PUBLIC_ORIGIN}/p/${r.slug}`;
+      const title = r.title || 'Voice memo';
+      return `
+        <div class="card stack recent-item" data-slug="${r.slug}">
+          <div>
+            <div style="font-weight: 600; font-size: 16px; word-break: break-word;" class="recent-title">${escHtml(title)}</div>
+            <div class="muted" style="font-size: 13px; margin-top: 2px;">
+              ${fmtDuration(r.duration_sec)} · ${r.parts.length} part${r.parts.length !== 1 ? 's' : ''}
+            </div>
+          </div>
+          <div class="link-box recent-link">${escHtml(shareLink)}</div>
+          <button type="button" class="btn btn-block copy-btn" data-url="${escHtml(shareLink)}">Copy link</button>
+          <div class="row">
+            <a class="btn btn-secondary" href="/p/${r.slug}" target="_blank" rel="noopener">Open</a>
+            <button type="button" class="btn btn-secondary rename-btn" data-slug="${r.slug}">Rename</button>
+            <button type="button" class="btn btn-danger delete-btn" data-slug="${r.slug}" data-title="${escHtml(title)}">Delete</button>
+          </div>
         </div>
-      `).join('')}
-    </div>
+      `;
+    }).join('')}
+    <script>
+      // ---- Copy link ----
+      document.querySelectorAll('.copy-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const url = btn.dataset.url;
+          try {
+            await navigator.clipboard.writeText(url);
+            const prev = btn.textContent;
+            btn.textContent = 'Copied!';
+            setTimeout(() => { btn.textContent = prev; }, 1500);
+          } catch (e) {
+            btn.textContent = 'Copy failed — long-press the link';
+          }
+        });
+      });
+
+      // ---- Rename ----
+      document.querySelectorAll('.rename-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const item = btn.closest('.recent-item');
+          const current = item.querySelector('.recent-title').textContent;
+          const next = prompt('New title', current);
+          if (next == null) return;
+          const title = next.trim();
+          if (!title) { alert('Title cannot be empty.'); return; }
+          const res = await fetch('/api/rename/' + btn.dataset.slug, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title }),
+            credentials: 'same-origin',
+          });
+          if (res.ok) {
+            item.querySelector('.recent-title').textContent = title;
+          } else {
+            alert('Rename failed.');
+          }
+        });
+      });
+
+      // ---- Delete ----
+      document.querySelectorAll('.delete-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const title = btn.dataset.title || 'this recording';
+          const ok = confirm('Delete "' + title + '"?\\n\\nThe share link will stop working and the audio will be removed from storage. This cannot be undone.');
+          if (!ok) return;
+          btn.disabled = true;
+          btn.textContent = 'Deleting…';
+          const res = await fetch('/api/delete/' + btn.dataset.slug, {
+            method: 'POST',
+            credentials: 'same-origin',
+          });
+          if (res.ok) {
+            const item = btn.closest('.recent-item');
+            item.parentNode.removeChild(item);
+          } else {
+            btn.disabled = false;
+            btn.textContent = 'Delete';
+            alert('Delete failed.');
+          }
+        });
+      });
+    </script>
   `;
 
   res.send(layout({
@@ -245,17 +345,32 @@ app.post('/api/upload', requireOwner, upload.single('audio'), async (req, res) =
 
   try {
     console.log(`[upload] received ${file.originalname} (${file.size} bytes)`);
-    const baseName = nanoid(10);
+    const baseName = nanoid(10); // internal work-dir prefix, never shown
 
     // Transcode + split to parts
     const { parts, durationSec } = prepareParts(file.path, workDir, baseName);
     console.log(`[upload] produced ${parts.length} part(s), ${durationSec}s total`);
 
+    // Resolve the title: user-typed value takes priority, otherwise fall back
+    // to the uploaded filename without its extension. This same value drives
+    // (a) the title shown on the listen page, (b) the displayName sent to GHL
+    // so Mosh can find the file in the GHL media library later, and (c) the
+    // Content-Disposition filename when a listener taps Download.
+    const userTitle = (req.body.title || '').toString().trim();
+    const fallbackTitle = baseFilename(file.originalname) || 'Voice memo';
+    const title = (userTitle || fallbackTitle).slice(0, 200);
+
+    // Unique suffix on GHL names keeps two "Meeting notes" uploads from
+    // colliding in the folder — the Recent UI shows titles without it.
+    const uniq = nanoid(4);
+    const safeBase = sanitizeForFilename(title);
+
     // Upload each part to GHL
     const partUrls = [];
     for (let i = 0; i < parts.length; i++) {
       const p = parts[i];
-      const displayName = `${baseName}_${String(i + 1).padStart(3, '0')}.mp3`;
+      const partSuffix = parts.length > 1 ? `-part-${String(i + 1).padStart(2, '0')}` : '';
+      const displayName = `${safeBase}${partSuffix}-${uniq}.mp3`;
       const url = ghl.uploadToGhl(p, displayName);
       const size = fs.statSync(p).size;
       partUrls.push({ url, size });
@@ -265,7 +380,7 @@ app.post('/api/upload', requireOwner, upload.single('audio'), async (req, res) =
     const slug = nanoid(8);
     db.insert({
       slug,
-      title: (req.body.title || '').toString().slice(0, 200),
+      title,
       durationSec,
       parts: partUrls,
     });
@@ -319,6 +434,69 @@ app.post('/api/upload', requireOwner, upload.single('audio'), async (req, res) =
   }
 });
 
+// ---- Admin-only: rename a recording's title. JSON body: {title: "..."} ----
+app.post('/api/rename/:slug', requireOwner, express.json(), (req, res) => {
+  const title = (req.body && req.body.title || '').toString().trim();
+  if (!title) return res.status(400).json({ ok: false, error: 'title required' });
+  const changed = db.updateTitle(req.params.slug, title.slice(0, 200));
+  if (!changed) return res.status(404).json({ ok: false, error: 'not found' });
+  console.log(`[rename] ${req.params.slug} → ${title}`);
+  res.json({ ok: true, title });
+});
+
+// ---- Admin-only: delete a recording (DB row + best-effort GHL cleanup) ----
+app.post('/api/delete/:slug', requireOwner, (req, res) => {
+  const parts = db.deleteBySlug(req.params.slug);
+  if (!parts) return res.status(404).json({ ok: false, error: 'not found' });
+  console.log(`[delete] ${req.params.slug} (${parts.length} part${parts.length !== 1 ? 's' : ''})`);
+  // Fire GHL deletes best-effort — don't block the response on their speed,
+  // and ignore failures (we already dropped the DB row, so the share link
+  // is already dead; orphan files in GHL are noise, not a correctness bug).
+  for (const p of parts) {
+    try { ghl.tryDeleteFromGhl(p.url); } catch {}
+  }
+  res.json({ ok: true });
+});
+
+// ---- Public: proxy a part as a download (adds Content-Disposition) ----
+//
+// GHL serves the MP3 inline (browsers play it in the tab instead of saving).
+// We can't force Content-Disposition on GHL's CDN URL without a signed URL,
+// so we stream it through our server with our own headers. The filename is
+// derived from the recording's title so it lands on disk with a useful name.
+app.get('/d/:slug/:idx', async (req, res) => {
+  const rec = db.getBySlug(req.params.slug);
+  if (!rec) return res.status(404).send('Not found');
+  const idx = parseInt(req.params.idx, 10);
+  if (!Number.isFinite(idx) || idx < 0 || idx >= rec.parts.length) {
+    return res.status(404).send('Not found');
+  }
+  const part = rec.parts[idx];
+  const title = rec.title || 'voice-memo';
+  const safeBase = sanitizeForFilename(title);
+  const partSuffix = rec.parts.length > 1 ? ` - Part ${idx + 1}` : '';
+  const filename = `${safeBase}${partSuffix}.mp3`;
+
+  try {
+    const upstream = await fetch(part.url);
+    if (!upstream.ok || !upstream.body) {
+      return res.status(502).send('Upstream error');
+    }
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Content-Disposition', `attachment; filename="${filename.replace(/"/g, '')}"`);
+    const len = upstream.headers.get('content-length');
+    if (len) res.set('Content-Length', len);
+    res.set('Cache-Control', 'public, max-age=3600');
+
+    // Node 20 fetch returns a web ReadableStream — turn it into a Node stream.
+    const { Readable } = require('node:stream');
+    Readable.fromWeb(upstream.body).pipe(res);
+  } catch (err) {
+    console.error('[download]', err);
+    res.status(502).send('Download failed');
+  }
+});
+
 app.get('/p/:slug', (req, res) => {
   const rec = db.getBySlug(req.params.slug);
   if (!rec) {
@@ -336,12 +514,22 @@ app.get('/p/:slug', (req, res) => {
   const totalParts = parts.length;
   const ogAudio = parts[0] && parts[0].url;
 
+  // Download buttons: one per part for multi-part, one labeled "Download" otherwise.
+  const downloadBlock = totalParts === 1
+    ? `<a class="btn btn-secondary btn-block" href="/d/${rec.slug}/0" download>⬇ Download</a>`
+    : `<div class="row" style="margin-top: 8px;">
+         ${parts.map((_p, i) => `
+           <a class="btn btn-secondary" href="/d/${rec.slug}/${i}" download>⬇ Part ${i + 1}</a>
+         `).join('')}
+       </div>`;
+
   const body = `
     <h1>${escHtml(title)}</h1>
     <p class="muted">${fmtDuration(rec.duration_sec)} · ${totalParts} part${totalParts !== 1 ? 's' : ''}</p>
     <div class="card">
-      <audio id="player" class="player" controls preload="metadata" controlslist="nodownload" src="${escHtml(parts[0].url)}"></audio>
+      <audio id="player" class="player" controls preload="metadata" src="${escHtml(parts[0].url)}"></audio>
       <div class="part-label" id="partLabel">${totalParts > 1 ? 'Part 1 of ' + totalParts : ''}</div>
+      ${downloadBlock}
     </div>
     <div class="footer">Shared from ${escHtml(SITE_NAME)}</div>
     <script>
